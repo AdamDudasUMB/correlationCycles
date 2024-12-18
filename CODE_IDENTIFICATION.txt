@@ -1,0 +1,146 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import networkx as nx
+from matplotlib.path import Path
+from matplotlib.patches import PathPatch
+from collections import defaultdict
+
+# Define parameters for cycle filtering and visualization
+MIN_CYCLE_SIZE = 3 # Adjust as needed
+MAX_CYCLES_PER_FIGURE = 16  # Adjust as needed
+
+# Sample graph data
+data = pd.read_csv('3-superconductivity.csv', sep=',')
+
+print(data)
+
+# Constructing the correlation graph
+correlation_matrix = data.corr(method='spearman')
+values = np.absolute(correlation_matrix.values)
+
+mask = ~np.eye(values.shape[0], dtype=bool)
+off_diagonal_values = values[mask]
+
+max_value = np.max(off_diagonal_values)
+mean_value = np.mean(off_diagonal_values)
+sigma = (max_value + mean_value) / 2
+
+corr_pruned = correlation_matrix.copy()
+corr_pruned[correlation_matrix.abs() < sigma] = 0
+corr_pruned = corr_pruned.round(3)
+
+G = nx.Graph()
+for i in range(len(corr_pruned)):
+    for j in range(i + 1, len(corr_pruned)):
+        weight = corr_pruned.iloc[i, j]
+        if weight != 0:
+            G.add_edge(corr_pruned.index[i], corr_pruned.columns[j], weight=weight)
+
+# Get all cycles in the graph using NetworkX
+all_cycles = list(nx.cycle_basis(G))
+
+# Print total cycles found
+print(f"Total cycles found: {len(all_cycles)}")
+
+# Function to create an ordered circular layout for a cycle
+def ordered_circular_layout(cycle):
+    """
+    Creates a circular layout for nodes in the given cycle, ensuring they are ordered sequentially.
+    :param cycle: List of nodes in the cycle.
+    :return: Dictionary mapping each node to its position in a circle.
+    """
+    n = len(cycle)
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)  # Evenly spaced angles
+    positions = {node: (np.cos(angle), np.sin(angle)) for node, angle in zip(cycle, theta)}
+    return positions
+
+# Group cycles by size
+cycles_by_size = defaultdict(list)
+for cycle in all_cycles:
+    cycles_by_size[len(cycle)].append(cycle)
+
+# Filter cycles by the minimum size
+filtered_cycles_by_size = {
+    size: cycles for size, cycles in cycles_by_size.items() if size >= MIN_CYCLE_SIZE
+}
+
+# Visualize cycles grouped by size, with limits on cycles per figure
+if filtered_cycles_by_size:
+    for size, cycles in sorted(filtered_cycles_by_size.items()):
+        total_batches = -(-len(cycles) // MAX_CYCLES_PER_FIGURE)  # Ceiling division for batching
+
+        for batch in range(total_batches):
+            batch_cycles = cycles[batch * MAX_CYCLES_PER_FIGURE:(batch + 1) * MAX_CYCLES_PER_FIGURE]
+            num_columns = min(4, len(batch_cycles))  # Limit to at most 4 cycles per row
+            num_rows = -(-len(batch_cycles) // num_columns)  # Ceiling division to determine number of rows
+            
+            fig, axs = plt.subplots(nrows=num_rows, ncols=num_columns, 
+                                    figsize=(5 * num_columns, 5 * num_rows))
+            axs = axs.flatten() if num_rows > 1 or num_columns > 1 else [axs]
+            plt.tight_layout(pad=3.0)  # Increase padding between subplots
+
+            # Use colormap for consistent node colors
+            colormap = plt.colormaps.get_cmap('Pastel1')
+            node_colors = [colormap(i / len(G.nodes)) for i in range(len(G.nodes))]
+            node_color_map = {node: node_colors[i] for i, node in enumerate(G.nodes)}
+
+            for i, cycle in enumerate(batch_cycles):
+                ax = axs[i]
+                subgraph = G.subgraph(cycle)
+
+                # Create ordered circular layout for the current cycle
+                circular_pos = ordered_circular_layout(cycle)
+
+                # Draw edges first with curved lines
+                for (u, v) in subgraph.edges():
+                    x1, y1 = circular_pos[u]
+                    x2, y2 = circular_pos[v]
+                    weight = G[u][v]['weight']
+                    # Curved edges: control the curvature with the `arc3` parameter
+                    ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                                arrowprops=dict(arrowstyle="-", lw=1, color="black",
+                                                connectionstyle="arc3,rad=0.2"))  # Adjust `rad` for curvature
+
+                # Now draw nodes after edges
+                nx.draw_networkx_nodes(subgraph, circular_pos, node_size=100, node_color='skyblue', 
+                                       edgecolors='darkblue', ax=ax)
+
+                # Draw labels with unique background colors
+                for node in subgraph.nodes():
+                    x, y = circular_pos[node]
+                    ax.text(x, y, node.replace('_', '\n'), fontsize=14, color='black', fontfamily='sans-serif',
+                        ha='center', va='center',
+                        bbox=dict(facecolor=node_color_map[node], edgecolor='black', boxstyle='round,pad=0.3'))
+
+
+                # Add edge weights manually on top of the edges
+                for (u, v) in subgraph.edges():
+                    x1, y1 = circular_pos[u]
+                    x2, y2 = circular_pos[v]
+                    weight = G[u][v]['weight']
+                    xm, ym = (x1 + x2) / 2, (y1 + y2) / 2  # Midpoint of the edge
+                    ax.text(xm, ym, f"{weight:.3f}", fontsize=8, color='black', 
+                            bbox=dict(facecolor='white', edgecolor='white', boxstyle='round,pad=0.0'))
+
+                # Adjust padding: make sure the layout has enough space around it
+                margin = 0.1
+                ax.set_xlim(min(circular_pos.values(), key=lambda p: p[0])[0] - margin,
+                            max(circular_pos.values(), key=lambda p: p[0])[0] + margin)
+                ax.set_ylim(min(circular_pos.values(), key=lambda p: p[1])[1] - margin,
+                            max(circular_pos.values(), key=lambda p: p[1])[1] + margin)
+
+                ax.axis('off')
+
+            # Remove any empty subplots
+            for j in range(len(batch_cycles), len(axs)):
+                fig.delaxes(axs[j])
+
+            # Save the file for this batch
+            output_filename = f"output_cycles_size_{size}_batch_{batch + 1}.png"
+            plt.savefig(output_filename, dpi=1200)
+            print(f"Saved: {output_filename}")
+
+            plt.close(fig)
+else:
+    print("No cycles found to visualize.")

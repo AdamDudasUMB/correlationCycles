@@ -1,0 +1,205 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import networkx as nx
+from collections import defaultdict
+
+# Define parameters for cycle filtering and visualization
+MIN_CYCLE_SIZE = 6  # Adjust as needed
+MAX_CYCLES_PER_FIGURE = 4  # Adjust as needed
+IN = "wtd_gmean_ThermCond"  # Replace with your actual IN node
+OUT = "wtd_mean_Valence"  # Single OUT node
+
+# Load data
+data = pd.read_csv('3-superconductivity.csv', sep=',')
+
+print(data)
+
+# Constructing the correlation graph
+correlation_matrix = data.corr(method='spearman')
+values = np.absolute(correlation_matrix.values)
+
+mask = ~np.eye(values.shape[0], dtype=bool)
+off_diagonal_values = values[mask]
+
+max_value = np.max(off_diagonal_values)
+mean_value = np.mean(off_diagonal_values)
+sigma = (max_value + mean_value) / 2
+
+corr_pruned = correlation_matrix.copy()
+corr_pruned[correlation_matrix.abs() < sigma] = 0
+corr_pruned = corr_pruned.round(3)
+
+G = nx.Graph()
+for i in range(len(corr_pruned)):
+    for j in range(i + 1, len(corr_pruned)):
+        weight = corr_pruned.iloc[i, j]
+        if weight != 0:
+            G.add_edge(corr_pruned.index[i], corr_pruned.columns[j], weight=weight)
+
+# Get all cycles in the graph using NetworkX
+all_cycles = list(nx.cycle_basis(G))
+
+# Print total cycles found
+print(f"Total cycles found: {len(all_cycles)}")
+
+# Filter cycles by the minimum size
+cycles_by_size = defaultdict(list)
+for cycle in all_cycles:
+    if len(cycle) >= MIN_CYCLE_SIZE:
+        cycles_by_size[len(cycle)].append(cycle)
+
+# Custom left-to-right hierarchical layout
+def hierarchical_layout(tree, root):
+    """
+    Generate a left-to-right hierarchical layout for a directed graph with a specified root.
+    :param tree: A NetworkX DiGraph representing the tree.
+    :param root: The root node for the tree.
+    :return: Dictionary mapping each node to a position (x, y).
+    """
+    layers = defaultdict(list)
+    visited = set()
+    queue = [(root, 0)]  # (node, depth)
+
+    while queue:
+        node, depth = queue.pop(0)
+        if node not in visited:
+            visited.add(node)
+            layers[depth].append(node)
+            for neighbor in tree.successors(node):
+                queue.append((neighbor, depth + 1))
+
+    pos = {}
+    max_height = max(len(nodes) for nodes in layers.values())
+    for depth, nodes in layers.items():
+        height = len(nodes)
+        y_start = -0.5 * (height - 1)  # Center nodes vertically
+        for i, node in enumerate(nodes):
+            pos[node] = (depth, y_start + i)  # x is depth, y is vertical position
+
+    return pos
+
+# Function to deconstruct a cycle into a tree graph with 1 OUT node duplicated for each branch
+def deconstruct_cycle_to_tree(cycle, G, IN, OUT, correlation_matrix):
+    """
+    Deconstructs a cycle into a tree graph with IN as the root and OUT as leaves.
+    :param cycle: List of nodes in the cycle.
+    :param G: The original graph.
+    :param IN: The root node for the tree.
+    :param OUT: The leaf node for the tree (duplicated for each branch).
+    :param correlation_matrix: The original correlation matrix.
+    :return: A NetworkX DiGraph representing the tree.
+    """
+    if IN not in cycle or OUT not in cycle:
+        raise ValueError(f"IN ({IN}) or OUT ({OUT}) not in cycle.")
+
+    # Find paths between IN and OUT
+    subgraph = G.subgraph(cycle)
+    paths_out = list(nx.all_simple_paths(subgraph, source=IN, target=OUT))
+
+    # Create a directed graph to represent the tree
+    tree = nx.DiGraph()
+    for path in paths_out:
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i + 1]
+            tree.add_edge(u, v, weight=subgraph[u][v]['weight'])
+
+    # Duplicate OUT node for each branch in the underlying graph
+    duplicated_tree = nx.DiGraph()
+    node_mapping = {}
+
+    for node in tree.nodes:
+        if node == OUT:
+            # Keep the OUT label for each duplicate with different variations
+            for idx, path in enumerate(paths_out):
+                if idx == 0:
+                    new_out_node = OUT  # First branch uses "OUT"
+                elif idx == 1:
+                    new_out_node = f" {OUT} "  # Second branch uses "OUT " (with a space)
+
+                node_mapping[(OUT, idx)] = new_out_node
+                for i in range(len(path) - 1):
+                    u, v = path[i], path[i + 1]
+                    if i + 1 == len(path) - 1:
+                        # Replace the original OUT with the new duplicated one
+                        duplicated_tree.add_edge(u, new_out_node, weight=subgraph[u][v]['weight'])
+                    else:
+                        duplicated_tree.add_edge(u, v, weight=subgraph[u][v]['weight'])
+        else:
+            duplicated_tree.add_node(node)
+
+    # Add the direct edge from IN to OUT_3
+    direct_edge_weight = correlation_matrix.at[IN, OUT]  # Correlation weight between IN and OUT
+    if direct_edge_weight != 0:  # Only add if there's a correlation
+        duplicated_tree.add_edge(IN, f"{OUT} ", weight=direct_edge_weight)
+
+    return duplicated_tree, node_mapping
+
+# Function to visualize a tree graph
+def visualize_tree(tree, ax, root, colormap, node_mapping, OUT):
+    """
+    Visualizes the tree graph using a left-to-right hierarchical layout.
+    :param tree: A NetworkX DiGraph representing the tree.
+    :param ax: The Matplotlib axis to plot on.
+    :param root: The root node of the tree.
+    :param colormap: The colormap to use for node colors.
+    :param node_mapping: Dictionary mapping the duplicated OUT nodes to the original OUT label.
+    :param OUT: The OUT label value (e.g., 'X35')
+    """
+    pos = hierarchical_layout(tree, root)
+    edge_labels = nx.get_edge_attributes(tree, 'weight')
+
+    node_colors = [colormap(i / len(tree.nodes)) for i, node in enumerate(tree.nodes)]
+    node_color_map = {node: node_colors[i] for i, node in enumerate(tree.nodes)}
+
+    # Draw nodes
+    nx.draw_networkx_nodes(tree, pos, ax=ax, node_size=100, node_color='skyblue', edgecolors='darkblue')
+
+    # Draw edges (straight edges, no arrows)
+    nx.draw_networkx_edges(tree, pos, ax=ax, edge_color='black', width=1, arrows=False)
+
+    # Draw node labels with background colors
+    for node, (x, y) in pos.items():
+        # Check if it's one of the OUT leaves and label all as OUT
+        if node.startswith("OUT"):  # Check if it's a leaf node
+            display_node = OUT  # Use OUT label for all duplicates
+        else:
+            display_node = node
+
+        display_node = display_node.replace('_', '\n')
+        
+        ax.text(x, y, display_node, fontsize=10, ha='center', va='center',
+                bbox=dict(facecolor=node_color_map[node], edgecolor='black', boxstyle='round,pad=0.3'))
+
+    # Add edge labels
+    for (u, v), weight in edge_labels.items():
+        xm, ym = (pos[u][0] + pos[v][0]) / 2, (pos[u][1] + pos[v][1]) / 2
+        ax.text(xm, ym, f"{weight:.3f}", fontsize=8, ha='center', va='center', bbox=dict(facecolor='white', edgecolor='white'))
+
+    ax.axis('off')
+
+# Visualize deconstructed cycles as trees
+for size, cycles in sorted(cycles_by_size.items()):
+    print(f"Processing cycles of size {size}...")
+    total_batches = -(-len(cycles) // MAX_CYCLES_PER_FIGURE)
+
+    for batch in range(total_batches):
+        batch_cycles = cycles[batch * MAX_CYCLES_PER_FIGURE:(batch + 1) * MAX_CYCLES_PER_FIGURE]
+        fig, axs = plt.subplots(1, len(batch_cycles), figsize=(8 * len(batch_cycles), 6))  # Increased figure width
+        axs = axs.flatten() if len(batch_cycles) > 1 else [axs]
+        plt.tight_layout(pad=3.0)
+
+        colormap = plt.colormaps.get_cmap('Pastel1')
+
+        for i, cycle in enumerate(batch_cycles):
+            try:
+                tree, node_mapping = deconstruct_cycle_to_tree(cycle, G, IN, OUT, correlation_matrix)
+                visualize_tree(tree, axs[i], IN, colormap, node_mapping, OUT)  # Pass OUT here
+            except ValueError as e:
+                print(e)
+                axs[i].axis('off')
+
+        output_filename = f"tree_cycles_size_{size}_batch_{batch + 1}.png"
+        plt.savefig(output_filename, dpi=1200)
+        print(f"Saved: {output_filename}")
+        plt.close(fig)
